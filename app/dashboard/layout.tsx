@@ -3,7 +3,7 @@ import { BarChart3, Compass, ListChecks, LogOut } from "lucide-react";
 import { redirect } from "next/navigation";
 import { signOut } from "@/app/dashboard/actions";
 import { createClient } from "@/lib/supabase/server";
-import { getUserWorkspace } from "@/lib/workspace";
+import { getUserWorkspaceId } from "@/lib/workspace";
 import { Button } from "@/components/ui/button";
 
 const navItems = [
@@ -26,8 +26,8 @@ export default async function DashboardLayout({
     redirect("/login");
   }
 
-  const userId = user.id; // <- aquí TS ya no duda
-  const workspace = await getUserWorkspace(supabase as any, userId);
+
+
 
 
   return (
@@ -39,8 +39,8 @@ export default async function DashboardLayout({
               Workspace
             </p>
             <h2 className="mt-1 text-lg font-semibold">
-              {workspace.workspaceName}
-            </h2>
+  Harbiz Prospecting
+</h2>
             <p className="text-xs text-slate-500">{user.email}</p>
           </div>
 
@@ -80,8 +80,8 @@ export default async function DashboardLayout({
                   Workspace
                 </p>
                 <h2 className="text-lg font-semibold">
-                  {workspace.workspaceName}
-                </h2>
+  Harbiz Prospecting
+</h2>
               </div>
               <form action={signOut}>
                 <Button type="submit" variant="outline" size="sm">

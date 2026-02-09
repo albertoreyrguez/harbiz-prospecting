@@ -1,76 +1,102 @@
-// lib/workspace.ts
-import type { SupabaseClient } from "@supabase/supabase-js";
-import type { Database } from "@/types/database";
+import type { SupabaseClient } from '@supabase/supabase-js';
 
-type WorkspaceRow = {
-  id: string;
-  name: string;
-  owner_id: string;
-};
-
-type WorkspaceInsert = {
-  name: string;
-  owner_id: string;
-};
-
-type MemberInsert = {
+type WorkspaceMemberRow = {
   workspace_id: string;
   user_id: string;
-  role: string;
+  role: 'owner' | 'admin' | 'member';
 };
 
-export async function ensureDefaultWorkspace(
-  supabase: SupabaseClient<Database>,
+function getDefaultWorkspaceId() {
+  // Server-side (Vercel + local). No lo pongas como NEXT_PUBLIC.
+  return (process.env.DEFAULT_WORKSPACE_ID ?? '').trim() || null;
+}
+
+async function ensureMember(
+  admin: SupabaseClient,
+  workspaceId: string,
   userId: string
-): Promise<WorkspaceRow> {
-  if (!userId) throw new Error("ensureDefaultWorkspace: userId is required");
+) {
+  // Si ya existe, no hacemos nada. Si no existe, lo insertamos como member.
+  const { data: existing, error: existingErr } = await admin
+    .from('workspace_members')
+    .select('workspace_id,user_id,role')
+    .eq('workspace_id', workspaceId)
+    .eq('user_id', userId)
+    .maybeSingle();
 
-  const newWorkspace: WorkspaceInsert = {
-    name: "Mi workspace",
-    owner_id: userId,
-  };
+  if (existingErr) throw existingErr;
 
-  const { data: ws, error: wsError } = await (supabase as any)
-    .from("workspaces")
-    .upsert(newWorkspace, { onConflict: "owner_id" })
-    .select("id,name,owner_id")
+  if (!existing) {
+    const { error: insertErr } = await admin
+      .from('workspace_members')
+      .insert({
+        workspace_id: workspaceId,
+        user_id: userId,
+        role: 'member'
+      } satisfies WorkspaceMemberRow);
+
+    // si por carrera ya lo insertó otro proceso, lo ignoramos
+    if (insertErr && (insertErr as any).code !== '23505') throw insertErr;
+  }
+}
+
+export async function getUserWorkspaceId(admin: SupabaseClient, userId: string) {
+  const forcedWorkspaceId = getDefaultWorkspaceId();
+
+  // ✅ MODO “UN SOLO WORKSPACE PARA TODOS”
+  if (forcedWorkspaceId) {
+    // (opcional) verifica que el workspace exista
+    const { data: ws, error: wsErr } = await admin
+      .from('workspaces')
+      .select('id')
+      .eq('id', forcedWorkspaceId)
+      .maybeSingle();
+
+    if (wsErr) throw wsErr;
+    if (!ws) {
+      throw new Error(
+        `DEFAULT_WORKSPACE_ID (${forcedWorkspaceId}) no existe en public.workspaces`
+      );
+    }
+
+    // Asegura membership (para no romper si activas RLS en el futuro)
+    await ensureMember(admin, forcedWorkspaceId, userId);
+
+    return forcedWorkspaceId;
+  }
+
+  // -------------------------
+  // Fallback (por si no defines env var)
+  // -------------------------
+  const { data: memberships, error: membershipsError } = await admin
+    .from('workspace_members')
+    .select('workspace_id,created_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true });
+
+  if (membershipsError) throw membershipsError;
+
+  const first = memberships?.[0]?.workspace_id;
+  if (first) return first;
+
+  // Si no hay membership, crea workspace + membership owner
+  const { data: workspace, error: workspaceError } = await admin
+    .from('workspaces')
+    .insert({ name: 'Default workspace' })
+    .select('id')
     .single();
 
-  if (wsError) throw wsError;
-  if (!ws) throw new Error("Failed to create or fetch workspace");
+  if (workspaceError || !workspace) {
+    throw new Error(workspaceError?.message ?? 'Failed to create workspace');
+  }
 
-  const newMember: MemberInsert = {
-    workspace_id: ws.id,
+  const { error: memberError } = await admin.from('workspace_members').insert({
+    workspace_id: workspace.id,
     user_id: userId,
-    role: "owner",
-  };
+    role: 'owner'
+  } satisfies WorkspaceMemberRow);
 
-  const { error: memberError } = await (supabase as any)
-    .from("workspace_members")
-    .upsert(newMember, { onConflict: "workspace_id,user_id" });
+  if (memberError) throw new Error(memberError.message);
 
-  if (memberError) throw memberError;
-
-  return ws as WorkspaceRow;
-}
-
-export async function getUserWorkspace(
-  supabase: SupabaseClient<Database>,
-  userId: string
-) {
-  const ws: WorkspaceRow = await ensureDefaultWorkspace(supabase, userId);
-
-  return {
-    workspaceId: ws.id,
-    workspaceName: ws.name,
-    ownerId: ws.owner_id,
-  };
-}
-
-export async function getUserWorkspaceId(
-  supabase: SupabaseClient<Database>,
-  userId: string
-) {
-  const ws = await getUserWorkspace(supabase, userId);
-  return ws.workspaceId;
+  return workspace.id;
 }
