@@ -70,7 +70,8 @@ export async function GET(request: NextRequest) {
   let query = admin
     .from("leads")
     .select(
-      "id,owner_id,status,notes,source_query,confidence,discovered_at,created_at,updated_at,display_name,bio,website,generated_copy,profiles(id,instagram_handle,full_name,business_type,city,country)"
+      // 👇 IMPORTANTE: incluimos profiles.bio y profiles.website para poder generar copy
+      "id,owner_id,status,notes,source_query,confidence,discovered_at,created_at,updated_at,display_name,bio,website,generated_copy,profiles(id,instagram_handle,full_name,bio,website,business_type,city,country)"
     )
     .eq("workspace_id", workspaceId)
     .order("updated_at", { ascending: false });
@@ -117,10 +118,34 @@ export async function GET(request: NextRequest) {
   const ownerIds = filtered.map((l: any) => l.owner_id).filter(Boolean);
   const ownerLabelMap = await getOwnerLabels(admin, ownerIds);
 
-  const withOwnerLabel = filtered.map((lead: any) => ({
-    ...lead,
-    owner_label: ownerLabelMap.get(lead.owner_id) ?? lead.owner_id,
-  }));
+  // 4) añadimos owner_label + generated_copy (si viene null lo generamos al vuelo)
+  const withOwnerLabel = filtered.map((lead: any) => {
+    const owner_label = ownerLabelMap.get(lead.owner_id) ?? lead.owner_id;
+
+    const bio =
+      lead.profiles?.bio ??
+      lead.bio ??
+      "";
+
+    const displayName =
+      lead.profiles?.full_name ??
+      lead.display_name ??
+      "";
+
+    const generated_copy =
+      lead.generated_copy ??
+      generateHarbizCopy({
+        ownerEmail: owner_label || "",
+        displayName,
+        bio,
+      });
+
+    return {
+      ...lead,
+      owner_label,
+      generated_copy,
+    };
+  });
 
   return NextResponse.json({ leads: withOwnerLabel });
 }
@@ -193,7 +218,8 @@ export async function POST(request: NextRequest) {
       discovered_at: new Date().toISOString(),
     })
     .select(
-      "id,owner_id,status,notes,source_query,confidence,discovered_at,created_at,updated_at,display_name,bio,website,generated_copy,profiles(id,instagram_handle,full_name,business_type,city,country)"
+      // 👇 IMPORTANTE: incluimos profiles.bio y profiles.website
+      "id,owner_id,status,notes,source_query,confidence,discovered_at,created_at,updated_at,display_name,bio,website,generated_copy,profiles(id,instagram_handle,full_name,bio,website,business_type,city,country)"
     )
     .single();
 
