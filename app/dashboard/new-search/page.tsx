@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label';
 import { Progress } from '@/components/ui/progress';
 import { Select } from '@/components/ui/select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { generateHarbizCopy } from '@/lib/harbizCopy';
 
 type SearchLead = {
   id: string;
@@ -21,6 +22,7 @@ type SearchLead = {
     business_type: string | null;
     city: string | null;
     country: string | null;
+    bio?: string | null; // por si lo añadimos luego desde API
   } | null;
 };
 
@@ -46,6 +48,10 @@ export default function NewSearchPage() {
   const [result, setResult] = useState<SearchResponse | null>(null);
   const [progress, setProgress] = useState(0);
   const [displayProcessed, setDisplayProcessed] = useState(0);
+
+  // ⚠️ TEMPORAL: en esta pantalla no tenemos el email del usuario autenticado.
+  // Más adelante lo hacemos automático desde backend.
+  const ownerEmailForCopy = 'albertorey@harbiz.io';
 
   // estimación fija solo para la barrita de progreso
   const totalQueries = useMemo(() => 40, []);
@@ -119,6 +125,18 @@ export default function NewSearchPage() {
 
     setLoading(false);
   };
+
+  async function handleSendDM(username: string, message: string) {
+    try {
+      await navigator.clipboard.writeText(message);
+      window.open(`https://www.instagram.com/${username}/`, '_blank', 'noopener,noreferrer');
+      // opcional: alert corto
+      // alert("Copiado ✅ Pega el mensaje en Instagram (Cmd/Ctrl+V) y envía.");
+    } catch {
+      window.open(`https://www.instagram.com/${username}/`, '_blank', 'noopener,noreferrer');
+      alert('No pude copiar automáticamente. Copia el mensaje manualmente:\n\n' + message);
+    }
+  }
 
   return (
     <section className="space-y-6">
@@ -235,12 +253,24 @@ export default function NewSearchPage() {
                   <TableHead>Business type</TableHead>
                   <TableHead>Location</TableHead>
                   <TableHead>Confidence</TableHead>
-                  <TableHead>Source query</TableHead>
+                  <TableHead>Copy</TableHead>
+                  <TableHead>DM</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {result.leads.map((lead) => {
                   const handle = (lead.profiles?.instagram_handle ?? '').replace(/^@/, '');
+
+                  // Si en el futuro la API devuelve profiles.bio, lo usamos.
+                  // Si no, usamos source_query como fallback (no ideal, pero genera algo).
+                  const bioFallback = (lead as any)?.profiles?.bio ?? lead.source_query ?? '';
+
+                  const copy = generateHarbizCopy({
+                    ownerEmail: ownerEmailForCopy,
+                    displayName: lead.profiles?.full_name ?? '',
+                    bio: bioFallback,
+                  });
+
                   return (
                     <TableRow key={lead.id}>
                       <TableCell>
@@ -257,12 +287,34 @@ export default function NewSearchPage() {
                           '-'
                         )}
                       </TableCell>
+
                       <TableCell>{lead.profiles?.business_type ?? '-'}</TableCell>
                       <TableCell>
                         {[lead.profiles?.city, lead.profiles?.country].filter(Boolean).join(', ') || '-'}
                       </TableCell>
                       <TableCell>{lead.confidence ?? '-'}</TableCell>
-                      <TableCell className="max-w-[220px] truncate">{lead.source_query ?? '-'}</TableCell>
+
+                      <TableCell className="min-w-[340px]">
+                        <textarea
+                          readOnly
+                          value={copy}
+                          className="w-full rounded border border-slate-200 p-2 text-xs leading-5"
+                          rows={5}
+                        />
+                      </TableCell>
+
+                      <TableCell>
+                        {handle ? (
+                          <Button
+                            onClick={() => handleSendDM(handle, copy)}
+                            className="whitespace-nowrap"
+                          >
+                            Enviar DM
+                          </Button>
+                        ) : (
+                          '-'
+                        )}
+                      </TableCell>
                     </TableRow>
                   );
                 })}
