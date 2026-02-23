@@ -3,6 +3,8 @@ import { getAuthenticatedUser } from "@/lib/auth";
 import { runInstagramDeepSearch } from "@/lib/search/instagram";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getUserWorkspaceId } from "@/lib/workspace";
+import { getOpenAIClient, getOpenAIModel } from "@/lib/openai";
+import { generateHarbizCopy } from "@/lib/harbizCopy";
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
@@ -77,6 +79,98 @@ function parseLocation(
   return { country: parts[0], city: null };
 }
 
+// --- util: pequeña cola/concurrencia (para no reventar OpenAI) ---
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, idx: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length) as any;
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+function safeText(v: any) {
+  return typeof v === "string" ? v : "";
+}
+
+function normalizeHandle(handle: string) {
+  return safeText(handle).replace(/^@/, "").trim();
+}
+
+async function generateCopyWithOpenAI(input: {
+  ownerEmail: string;
+  profileType: "PT" | "Center";
+  handle: string;
+  title: string;
+  snippet: string;
+  country: string | null;
+  city: string | null;
+}) {
+  // fallback determinista si OpenAI falla
+  const fallback = generateHarbizCopy({
+    ownerEmail: input.ownerEmail,
+    displayName: input.title || "",
+    bio: input.snippet || "",
+  });
+
+  try {
+    const openai = getOpenAIClient();
+    const model = getOpenAIModel();
+
+    const userPrompt = `
+Escribe un único mensaje DM en español neutro para contactar en frío.
+Contexto: Soy SDR de Harbiz. Harbiz ayuda a coaches o studios (según tipo) a ordenar planes/seguimiento/comunicación y, si aplica, reservas/clases/membresías.
+Reglas OBLIGATORIAS:
+- NO inventes datos. Usa SOLO lo que está en "Datos reales".
+- NO uses "¿" de apertura. Las preguntas solo con "?" al final.
+- Máximo 4 líneas.
+- Tono humano, cercano, cero robótico. Sin emojis (o como mucho 1, pero mejor 0).
+- Incluye "Soy {SDR_NAME}" donde SDR_NAME se obtiene del email (antes de @; si viene "albertorey..." usa "Alberto" como nombre).
+- Si es PT: pregunta por cómo lo lleva (WhatsApp/Excel o app).
+- Si es Center: pregunta por reservas (DM/WhatsApp o sistema).
+Devuelve SOLO JSON válido con la clave "copy".
+
+Datos reales:
+- tipo: ${input.profileType}
+- instagram_handle: ${input.handle}
+- title (Serper): ${input.title}
+- snippet (Serper): ${input.snippet}
+- ciudad: ${input.city ?? ""}
+- país: ${input.country ?? ""}
+- sdr_email: ${input.ownerEmail}
+`;
+
+    const resp = await openai.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: "Devuelve SOLO JSON válido. No incluyas texto fuera del JSON." },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.6,
+    });
+
+    const raw = resp.choices?.[0]?.message?.content ?? "";
+    const parsed = JSON.parse(raw);
+    const copy = typeof parsed?.copy === "string" ? parsed.copy.trim() : "";
+
+    return copy || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export async function POST(request: NextRequest) {
   const user = await getAuthenticatedUser();
 
@@ -121,6 +215,9 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // ✅ TypeScript-safe
+  const profileType = payload.profileType as "PT" | "Center";
+
   const count = Math.min(Math.max(Number(payload.count ?? 20), 1), 100);
   const keywords = payload.keywords.trim();
 
@@ -152,14 +249,14 @@ export async function POST(request: NextRequest) {
     const searchOutput = await runInstagramDeepSearch({
       location: locationForSearch,
       keywords,
-      profileType: payload.profileType,
+      profileType,
       count,
     });
 
     const admin = createAdminClient();
     const workspaceId = await getUserWorkspaceId();
 
-    const queryLabel = `${payload.profileType}: ${keywords} @ ${locationForSearch}`;
+    const queryLabel = `${profileType}: ${keywords} @ ${locationForSearch}`;
 
     // 1) Guardar run
     const { data: run, error: runError } = await admin
@@ -170,7 +267,7 @@ export async function POST(request: NextRequest) {
         query: queryLabel,
         filters: {
           actor,
-          profileType: payload.profileType,
+          profileType,
           country,
           city,
           locationForSearch,
@@ -190,11 +287,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 2) Guardar perfiles (guardamos country/city)
+    // 2) Guardar perfiles (incluimos bio=snippet)
     const profileRows = searchOutput.selected.map((item) => ({
-      instagram_handle: item.handle,
+      instagram_handle: normalizeHandle(item.handle),
       full_name: null,
-      business_type: payload.profileType === "PT" ? "Personal Trainer" : "Fitness Center",
+      bio: safeText(item.snippet) || null,
+      website: null,
+      business_type: profileType === "PT" ? "Personal Trainer" : "Fitness Center",
       city,
       country,
       source_payload: {
@@ -211,7 +310,7 @@ export async function POST(request: NextRequest) {
     const { data: savedProfiles, error: profilesError } = await admin
       .from("profiles")
       .upsert(profileRows, { onConflict: "instagram_handle" })
-      .select("id,instagram_handle");
+      .select("id,instagram_handle,bio,website,full_name,business_type,city,country");
 
     if (profilesError || !savedProfiles) {
       return NextResponse.json(
@@ -224,11 +323,45 @@ export async function POST(request: NextRequest) {
       (savedProfiles as any[]).map((profile) => [profile.instagram_handle, profile.id])
     );
 
-    // 3) Guardar leads
+    const savedProfileByHandle = new Map(
+      (savedProfiles as any[]).map((p) => [p.instagram_handle, p])
+    );
+
+    // 3) Generar copy con OpenAI (concurrencia baja)
+    const copies = await mapWithConcurrency(
+      searchOutput.selected,
+      4,
+      async (item) => {
+        const handle = normalizeHandle(item.handle);
+        const prof = savedProfileByHandle.get(handle);
+        const title = safeText(item.title);
+        const snippet = safeText(item.snippet);
+
+        const copy = await generateCopyWithOpenAI({
+          ownerEmail: actor,
+          profileType,
+          handle,
+          title,
+          snippet: prof?.bio ?? snippet,
+          country,
+          city,
+        });
+
+        return { handle, copy };
+      }
+    );
+
+    const copyByHandle = new Map(copies.map((c) => [c.handle, c.copy]));
+
+    // 4) Guardar leads con generated_copy + bio/display_name
     const leadRows = searchOutput.selected
       .map((item) => {
-        const profileId = profileByHandle.get(item.handle);
+        const handle = normalizeHandle(item.handle);
+        const profileId = profileByHandle.get(handle);
         if (!profileId) return null;
+
+        const prof = savedProfileByHandle.get(handle);
+        const generated_copy = copyByHandle.get(handle) ?? null;
 
         return {
           workspace_id: workspaceId,
@@ -239,6 +372,11 @@ export async function POST(request: NextRequest) {
           source_query: item.sourceQuery,
           confidence: Math.min(100, Math.max(0, Math.round(item.bestScore * 10))),
           discovered_at: new Date().toISOString(),
+
+          display_name: prof?.full_name ?? null,
+          bio: prof?.bio ?? null,
+          website: prof?.website ?? null,
+          generated_copy,
         };
       })
       .filter(Boolean);
@@ -247,7 +385,7 @@ export async function POST(request: NextRequest) {
       .from("leads")
       .upsert(leadRows as any, { onConflict: "workspace_id,profile_id" })
       .select(
-        "id,owner_id,actor,status,source_query,confidence,discovered_at,profiles(instagram_handle,full_name,business_type,city,country)"
+        "id,owner_id,actor,status,source_query,confidence,discovered_at,display_name,bio,website,generated_copy,profiles(instagram_handle,full_name,bio,website,business_type,city,country)"
       );
 
     if (leadsError) {
