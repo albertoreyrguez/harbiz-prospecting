@@ -6,6 +6,9 @@ import { getUserWorkspaceId } from "@/lib/workspace";
 import { getOpenAIClient, getOpenAIModel } from "@/lib/openai";
 import { generateHarbizCopy } from "@/lib/harbizCopy";
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
 
@@ -15,25 +18,40 @@ const rateLimitStore = new Map<string, RateEntry>();
 function checkRateLimit(userId: string) {
   const now = Date.now();
   const entry = rateLimitStore.get(userId);
+
   if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
     rateLimitStore.set(userId, { count: 1, windowStart: now });
     return true;
   }
+
   if (entry.count >= RATE_LIMIT_MAX_REQUESTS) return false;
   entry.count += 1;
   return true;
 }
 
-function parseLocation(input?: string | null, explicitCity?: string | null, explicitCountry?: string | null) {
+function parseLocation(
+  input?: string | null,
+  explicitCity?: string | null,
+  explicitCountry?: string | null
+) {
   const countryFromPayload = (explicitCountry ?? "").trim();
   const cityFromPayload = (explicitCity ?? "").trim();
 
-  if (countryFromPayload) return { country: countryFromPayload, city: cityFromPayload || null };
+  if (countryFromPayload) {
+    return {
+      country: countryFromPayload,
+      city: cityFromPayload || null,
+    };
+  }
 
   const loc = (input ?? "").trim();
   if (!loc) return { country: null, city: null };
 
-  const parts = loc.split(",").map((p) => p.trim()).filter(Boolean);
+  const parts = loc
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
   const first = (parts[0] ?? "").toLowerCase();
   const isOnline = first === "online" || first.includes("online");
 
@@ -46,7 +64,11 @@ function parseLocation(input?: string | null, explicitCity?: string | null, expl
   return { country: parts[0], city: null };
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, idx: number) => Promise<R>) {
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, idx: number) => Promise<R>
+): Promise<R[]> {
   const results: R[] = new Array(items.length) as any;
   let nextIndex = 0;
 
@@ -97,20 +119,31 @@ async function generateCopyOpenAIPlain(input: {
   const SDR_NAME = getSdrNameFromActor(input.actor);
 
   try {
-    const openai = getOpenAIClient();
+    const openai = await getOpenAIClient();
     const model = getOpenAIModel();
 
     const prompt = `
 Escribe 1 DM corto en español neutro para IG, en frío.
+
 Reglas:
 - NO inventes datos. Usa solo el título y el snippet.
-- NO uses "¿". Solo "?" al final si preguntas.
-- Máximo 4 líneas.
-- Sin emojis.
+- NO uses "¿". Solo "?" al final.
+- Máximo 3 líneas. Sin emojis. Nada de comillas.
+- Si no tienes nombre, no lo inventes.
+- Personaliza SIEMPRE con 1 HOOK real sacado del snippet/título (nicho, modalidad, identidad o promesa). Reescríbelo en tus palabras (no lo cites literal).
+- Estilo: humano, natural, sin pitch largo.
 - Empieza exactamente con: "Hola! Soy ${SDR_NAME}."
-- Incluye una microfrase literal del snippet (3 a 6 palabras) entre comillas, si hay snippet.
-- Si tipo=PT: pregunta cómo lo lleva (WhatsApp/Excel/Drive vs app).
-- Si tipo=Center: pregunta por reservas (DM/WhatsApp vs sistema).
+- Usa la frase "Le eché un vistazo" en la primera línea (tal cual).
+- No digas "vs app". No digas "me parece interesante tu enfoque como entrenador personal".
+
+Estructura:
+L1: "Hola! Soy ${SDR_NAME}. Le eché un vistazo a tu perfil y vi que {HOOK}."
+L2 (pregunta simple):
+  - Si tipo=PT: "Cómo lo llevas hoy, WhatsApp/Excel/Drive o ya usas alguna app?"
+  - Si tipo=Center: "Las reservas las gestionáis por WhatsApp/DM o con algún sistema?"
+L3 (contexto corto, 1 frase):
+  - PT: "Te lo pregunto porque en Harbiz ayudamos a coaches a tener planes, seguimiento y mensajes más ordenados."
+  - Center: "Te lo pregunto porque en Harbiz ayudamos a studios a ordenar reservas/clases y clientes sin depender del WhatsApp."
 
 Datos:
 tipo: ${input.profileType}
@@ -124,10 +157,10 @@ país: ${input.country ?? ""}
     const resp = await openai.chat.completions.create({
       model,
       messages: [
-        { role: "system", content: "Devuelve SOLO el mensaje final. Sin JSON, sin comillas extra, sin explicaciones." },
+        { role: "system", content: "Devuelve SOLO el mensaje final. Sin explicaciones." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.8,
+      temperature: 0.75,
     });
 
     let text = (resp.choices?.[0]?.message?.content ?? "").trim();
@@ -146,7 +179,10 @@ export async function POST(request: NextRequest) {
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   if (!checkRateLimit(user.id)) {
-    return NextResponse.json({ error: "Too many requests. Please wait and try again." }, { status: 429 });
+    return NextResponse.json(
+      { error: "Too many requests. Please wait and try again." },
+      { status: 429 }
+    );
   }
 
   const payload = (await request.json()) as {
@@ -160,10 +196,17 @@ export async function POST(request: NextRequest) {
   };
 
   if (!payload.keywords || !payload.profileType) {
-    return NextResponse.json({ error: "keywords and profileType are required" }, { status: 400 });
+    return NextResponse.json(
+      { error: "keywords and profileType are required" },
+      { status: 400 }
+    );
   }
+
   if (payload.profileType !== "PT" && payload.profileType !== "Center") {
-    return NextResponse.json({ error: "profileType must be PT or Center" }, { status: 400 });
+    return NextResponse.json(
+      { error: "profileType must be PT or Center" },
+      { status: 400 }
+    );
   }
 
   const profileType = payload.profileType as "PT" | "Center";
@@ -173,10 +216,17 @@ export async function POST(request: NextRequest) {
   const { country, city } = parseLocation(payload.location, payload.city, payload.country);
 
   const locationForSearch =
-    city && country ? `${city}, ${country}` : country ? country : (payload.location ?? "").trim();
+    city && country
+      ? `${city}, ${country}`
+      : country
+      ? country
+      : (payload.location ?? "").trim();
 
   if (!locationForSearch) {
-    return NextResponse.json({ error: "location is required (or provide country)" }, { status: 400 });
+    return NextResponse.json(
+      { error: "location is required (or provide country)" },
+      { status: 400 }
+    );
   }
 
   const actor = (payload.actor ?? "").trim() || ((user as any).email ?? user.id);
@@ -216,7 +266,10 @@ export async function POST(request: NextRequest) {
       .single();
 
     if (runError || !run) {
-      return NextResponse.json({ error: runError?.message ?? "Failed to create search run" }, { status: 500 });
+      return NextResponse.json(
+        { error: runError?.message ?? "Failed to create search run" },
+        { status: 500 }
+      );
     }
 
     const profileRows = searchOutput.selected.map((item) => ({
@@ -244,11 +297,18 @@ export async function POST(request: NextRequest) {
       .select("id,instagram_handle,bio,website,full_name,business_type,city,country");
 
     if (profilesError || !savedProfiles) {
-      return NextResponse.json({ error: profilesError?.message ?? "Failed to save profiles" }, { status: 500 });
+      return NextResponse.json(
+        { error: profilesError?.message ?? "Failed to save profiles" },
+        { status: 500 }
+      );
     }
 
-    const profileByHandle = new Map((savedProfiles as any[]).map((p) => [p.instagram_handle, p.id]));
-    const savedProfileByHandle = new Map((savedProfiles as any[]).map((p) => [p.instagram_handle, p]));
+    const profileByHandle = new Map(
+      (savedProfiles as any[]).map((p) => [p.instagram_handle, p.id])
+    );
+    const savedProfileByHandle = new Map(
+      (savedProfiles as any[]).map((p) => [p.instagram_handle, p])
+    );
 
     const copies = await mapWithConcurrency(searchOutput.selected, 4, async (item) => {
       const handle = normalizeHandle(item.handle);
@@ -278,7 +338,7 @@ export async function POST(request: NextRequest) {
         if (!profileId) return null;
 
         const prof = savedProfileByHandle.get(handle);
-        const c = copyByHandle.get(handle);
+        const meta = copyByHandle.get(handle);
 
         return {
           workspace_id: workspaceId,
@@ -293,9 +353,7 @@ export async function POST(request: NextRequest) {
           display_name: prof?.full_name ?? null,
           bio: prof?.bio ?? null,
           website: prof?.website ?? null,
-          generated_copy: c?.copy ?? null,
-
-          // extra debug fields (no DB columns): solo para response, se añaden abajo
+          generated_copy: meta?.copy ?? null,
         };
       })
       .filter(Boolean);
@@ -311,7 +369,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: leadsError.message }, { status: 500 });
     }
 
-    // añadimos copy_source/copy_error en respuesta para que lo veas en UI sin inspeccionar nada
     const leadsWithCopyMeta = (leads ?? []).map((l: any) => {
       const handle = normalizeHandle(l?.profiles?.instagram_handle ?? "");
       const meta = copyByHandle.get(handle);
