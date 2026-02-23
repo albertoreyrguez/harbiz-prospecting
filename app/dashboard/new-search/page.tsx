@@ -6,6 +6,8 @@ import { getUserWorkspaceId } from "@/lib/workspace";
 import { getOpenAIClient, getOpenAIModel } from "@/lib/openai";
 import { generateHarbizCopy } from "@/lib/harbizCopy";
 
+export const runtime = "nodejs";
+
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
 
