@@ -101,9 +101,8 @@ async function generateCopyOpenAIPlain(input: {
   const SDR_NAME = getSdrNameFromActor(input.actor);
 
   try {
-    const openai = getOpenAIClient();
-    const model = getOpenAIModel();
-
+    const openai = await getOpenAIClient();
+const model = getOpenAIModel();
     const prompt = `
 Escribe 1 DM corto en español neutro para IG, en frío.
 
