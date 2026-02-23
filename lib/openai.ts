@@ -1,5 +1,4 @@
-import 'server-only';
-import OpenAI from 'openai';
+import "server-only";
 
 function assertOpenAIKey(): string {
   const key =
@@ -8,21 +7,19 @@ function assertOpenAIKey(): string {
     process.env.OPENAI_KEY;
 
   if (!key) {
-    throw new Error(
-      'Missing OpenAI API key. Set OPENAI_API_KEY in .env.local'
-    );
+    throw new Error("Missing OpenAI API key. Set OPENAI_API_KEY in Vercel env.");
   }
-
   return key;
 }
 
-// ✅ NAMED EXPORTS (esto arregla tu error)
-export function getOpenAIClient() {
+// ✅ NO hay import OpenAI arriba. Se carga con lazy import.
+export async function getOpenAIClient() {
   const apiKey = assertOpenAIKey();
+  const mod = await import("openai");
+  const OpenAI = mod.default;
   return new OpenAI({ apiKey });
 }
 
 export function getOpenAIModel() {
-  // Puedes configurar esto en .env.local si quieres
-  return process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  return process.env.OPENAI_MODEL || "gpt-4o-mini";
 }
