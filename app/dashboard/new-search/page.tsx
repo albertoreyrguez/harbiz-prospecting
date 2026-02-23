@@ -1,335 +1,350 @@
-'use client';
+import { NextRequest, NextResponse } from "next/server";
+import { getAuthenticatedUser } from "@/lib/auth";
+import { runInstagramDeepSearch } from "@/lib/search/instagram";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { getUserWorkspaceId } from "@/lib/workspace";
+import { getOpenAIClient, getOpenAIModel } from "@/lib/openai";
+import { generateHarbizCopy } from "@/lib/harbizCopy";
 
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Progress } from '@/components/ui/progress';
-import { Select } from '@/components/ui/select';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { generateHarbizCopy } from '@/lib/harbizCopy';
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 5;
 
-type SearchLead = {
-  id: string;
-  status: string;
-  source_query: string | null;
-  confidence: number | null;
-  discovered_at: string;
+type RateEntry = { count: number; windowStart: number };
+const rateLimitStore = new Map<string, RateEntry>();
 
-  // ⬇️ viene del backend /api/search-instagram
-  generated_copy?: string | null;
-  copy_source?: 'openai' | 'fallback';
-  copy_error?: string | null;
+function checkRateLimit(userId: string) {
+  const now = Date.now();
+  const entry = rateLimitStore.get(userId);
 
-  profiles: {
-    instagram_handle: string;
-    full_name: string | null;
-    business_type: string | null;
-    city: string | null;
-    country: string | null;
-    bio?: string | null;
-    website?: string | null;
-  } | null;
-};
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateLimitStore.set(userId, { count: 1, windowStart: now });
+    return true;
+  }
 
-type SearchResponse = {
-  runId: string;
-  queryCount: number;
-  failures: string[];
-  leads: SearchLead[];
-};
+  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) return false;
+  entry.count += 1;
+  return true;
+}
 
-export default function NewSearchPage() {
-  const [location, setLocation] = useState('CDMX, Mexico');
-  const [keywords, setKeywords] = useState('personal trainer fuerza polanco');
-  const [profileType, setProfileType] = useState<'PT' | 'Center'>('PT');
-  const [count, setCount] = useState(20);
+function parseLocation(input?: string | null, explicitCity?: string | null, explicitCountry?: string | null) {
+  const countryFromPayload = (explicitCountry ?? "").trim();
+  const cityFromPayload = (explicitCity ?? "").trim();
 
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<SearchResponse | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [displayProcessed, setDisplayProcessed] = useState(0);
+  if (countryFromPayload) return { country: countryFromPayload, city: cityFromPayload || null };
 
-  // fallback por si backend no manda generated_copy (ya no debería pasar)
-  const ownerEmailForFallback = 'albertorey@harbiz.io';
+  const loc = (input ?? "").trim();
+  if (!loc) return { country: null, city: null };
 
-  const totalQueries = useMemo(() => 40, []);
+  const parts = loc.split(",").map((p) => p.trim()).filter(Boolean);
+  const first = (parts[0] ?? "").toLowerCase();
+  const isOnline = first === "online" || first.includes("online");
 
-  useEffect(() => {
-    if (!loading) {
-      setProgress(0);
-      setDisplayProcessed(0);
-      return;
-    }
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1];
+    const city = isOnline ? null : parts.slice(0, parts.length - 1).join(", ");
+    return { country: last, city: city || null };
+  }
 
-    const timer = setInterval(() => {
-      setProgress((prev) => Math.min(prev + 2, 92));
-      setDisplayProcessed((prev) => Math.min(prev + 1, totalQueries));
-    }, 450);
+  return { country: parts[0], city: null };
+}
 
-    return () => clearInterval(timer);
-  }, [loading, totalQueries]);
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, idx: number) => Promise<R>) {
+  const results: R[] = new Array(items.length) as any;
+  let nextIndex = 0;
 
-  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setLoading(true);
-    setError(null);
-    setResult(null);
-
-    const response = await fetch('/api/search-instagram', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        location: location.trim(),
-        keywords: keywords.trim(),
-        profileType,
-        count
-      })
-    });
-
-    const payload = (await response.json()) as SearchResponse | { error: string };
-
-    if (!response.ok) {
-      setError('error' in payload ? payload.error : 'Search failed');
-      setLoading(false);
-      return;
-    }
-
-    setProgress(100);
-    setDisplayProcessed((payload as SearchResponse).queryCount);
-    setResult(payload as SearchResponse);
-    setLoading(false);
-  };
-
-  const onSeedDemoData = async () => {
-    setLoading(true);
-    setError(null);
-
-    const response = await fetch('/api/mock-seed', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query: `${profileType} ${keywords} ${location}`,
-        country: location,
-        count: 10
-      })
-    });
-
-    if (!response.ok) {
-      const payload = (await response.json()) as { error?: string };
-      setError(payload.error ?? 'Unable to seed data');
-      setLoading(false);
-      return;
-    }
-
-    setLoading(false);
-  };
-
-  async function handleSendDM(username: string, message: string) {
-    try {
-      await navigator.clipboard.writeText(message);
-      window.open(`https://www.instagram.com/${username}/`, '_blank', 'noopener,noreferrer');
-    } catch {
-      window.open(`https://www.instagram.com/${username}/`, '_blank', 'noopener,noreferrer');
-      alert('No pude copiar automáticamente. Copia el mensaje manualmente:\n\n' + message);
+  async function worker() {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx], idx);
     }
   }
 
-  return (
-    <section className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold">Instagram deep search</h1>
-          <p className="text-sm text-slate-500">Serper search + dedupe + scoring + workspace lead creation.</p>
-        </div>
-        <Button variant="secondary" onClick={onSeedDemoData} disabled={loading}>
-          Seed demo data
-        </Button>
-      </div>
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Search parameters</CardTitle>
-          <CardDescription>
-            Usa <b>Location</b> para el “macro” (país / ciudad, país / Online, país). Usa <b>Keywords</b> para barrio, nicho, modalidad, etc.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form className="grid gap-4 md:grid-cols-2" onSubmit={onSubmit}>
-            <div className="space-y-2">
-              <Label htmlFor="location">Location</Label>
-              <Input
-                id="location"
-                value={location}
-                onChange={(event) => setLocation(event.target.value)}
-                placeholder="Ej: Mexico | CDMX, Mexico | Online, Colombia"
-                required
-              />
-              <p className="text-xs text-slate-500">
-                Ejemplos: <b>Mexico</b> (solo país), <b>Buenos Aires, Argentina</b> (ciudad + país), <b>Online, Mexico</b> (online en país).
-              </p>
-            </div>
+function safeText(v: any) {
+  return typeof v === "string" ? v : "";
+}
 
-            <div className="space-y-2">
-              <Label htmlFor="keywords">Keywords</Label>
-              <Input
-                id="keywords"
-                value={keywords}
-                onChange={(event) => setKeywords(event.target.value)}
-                placeholder="Ej: personal trainer fuerza polanco | coach online recomposición"
-                required
-              />
-              <p className="text-xs text-slate-500">
-                Mete aquí filtros finos: barrio (Polanco/Belgrano), modalidad (online), nicho (fuerza/pilates), etc.
-              </p>
-            </div>
+function normalizeHandle(handle: string) {
+  return safeText(handle).replace(/^@/, "").trim();
+}
 
-            <div className="space-y-2">
-              <Label htmlFor="profileType">Profile type</Label>
-              <Select
-                id="profileType"
-                value={profileType}
-                onChange={(event) => setProfileType(event.target.value as 'PT' | 'Center')}
-              >
-                <option value="PT">PT</option>
-                <option value="Center">Center</option>
-              </Select>
-            </div>
+function getSdrNameFromActor(actor: string) {
+  const local = (actor || "").split("@")[0] || "";
+  const first = local.split(/[._-]/)[0] || local;
+  if (!first) return "Equipo Harbiz";
+  if (first.toLowerCase().startsWith("alberto")) return "Alberto";
+  return first.charAt(0).toUpperCase() + first.slice(1);
+}
 
-            <div className="space-y-2">
-              <Label htmlFor="count">Lead count</Label>
-              <Input
-                id="count"
-                type="number"
-                min={1}
-                max={100}
-                value={count}
-                onChange={(event) => setCount(Number(event.target.value))}
-                required
-              />
-            </div>
+async function generateCopyOpenAIPlain(input: {
+  actor: string;
+  profileType: "PT" | "Center";
+  handle: string;
+  title: string;
+  snippet: string;
+  country: string | null;
+  city: string | null;
+}) {
+  const fallback = generateHarbizCopy({
+    ownerEmail: input.actor,
+    displayName: input.title || "",
+    bio: input.snippet || "",
+  });
 
-            <div className="md:col-span-2">
-              <Button type="submit" disabled={loading}>
-                {loading ? 'Running search...' : 'Run search'}
-              </Button>
-            </div>
-          </form>
-        </CardContent>
-      </Card>
+  const SDR_NAME = getSdrNameFromActor(input.actor);
 
-      {loading ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Searching</CardTitle>
-            <CardDescription>
-              Searching {displayProcessed}/{totalQueries} queries
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Progress value={progress} />
-          </CardContent>
-        </Card>
-      ) : null}
+  try {
+    const openai = getOpenAIClient();
+    const model = getOpenAIModel();
 
-      {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+    const prompt = `
+Escribe 1 DM corto en español neutro para IG, en frío.
 
-      {result ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Results ({result.leads.length})</CardTitle>
-            <CardDescription>
-              Search run {result.runId} · {result.queryCount} queries · failures: {result.failures.length}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Instagram</TableHead>
-                  <TableHead>Business type</TableHead>
-                  <TableHead>Location</TableHead>
-                  <TableHead>Confidence</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead>Copy</TableHead>
-                  <TableHead>DM</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {result.leads.map((lead) => {
-                  const handle = (lead.profiles?.instagram_handle ?? '').replace(/^@/, '');
-                  const bioFallback = (lead.profiles as any)?.bio ?? lead.source_query ?? '';
+Reglas:
+- NO inventes datos. Usa solo el título y el snippet.
+- NO uses "¿". Solo "?" al final.
+- Máximo 3 líneas. Sin emojis. Nada de comillas.
+- Si no tienes nombre, no lo inventes.
+- Personaliza SIEMPRE con 1 HOOK real sacado del snippet/título (nicho, modalidad, identidad o promesa). Reescríbelo en tus palabras (no lo cites literal).
+- Estilo: humano, natural, sin pitch largo.
+- Empieza exactamente con: "Hola! Soy ${SDR_NAME}."
+- Usa la frase "Le eché un vistazo" en la primera línea (tal cual).
+- No digas "vs app". No digas "me parece interesante tu enfoque como entrenador personal".
 
-                  const fallbackCopy = generateHarbizCopy({
-                    ownerEmail: ownerEmailForFallback,
-                    displayName: lead.profiles?.full_name ?? '',
-                    bio: bioFallback,
-                  });
+Estructura:
+L1: "Hola! Soy ${SDR_NAME}. Le eché un vistazo a tu perfil y vi que {HOOK}."
+L2 (pregunta simple):
+  - Si tipo=PT: "Cómo lo llevas hoy, WhatsApp/Excel/Drive o ya usas alguna app?"
+  - Si tipo=Center: "Las reservas las gestionáis por WhatsApp/DM o con algún sistema?"
+L3 (contexto corto, 1 frase):
+  - PT: "Te lo pregunto porque en Harbiz ayudamos a coaches a tener planes, seguimiento y mensajes más ordenados."
+  - Center: "Te lo pregunto porque en Harbiz ayudamos a studios a ordenar reservas/clases y clientes sin depender del WhatsApp."
 
-                  const copy = lead.generated_copy || fallbackCopy;
+Datos:
+tipo: ${input.profileType}
+handle: ${input.handle}
+título: ${input.title}
+snippet: ${input.snippet}
+ciudad: ${input.city ?? ""}
+país: ${input.country ?? ""}
+`;
 
-                  return (
-                    <TableRow key={lead.id}>
-                      <TableCell>
-                        {handle ? (
-                          <a
-                            href={`https://instagram.com/${handle}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="hover:underline"
-                          >
-                            @{handle}
-                          </a>
-                        ) : (
-                          '-'
-                        )}
-                      </TableCell>
+    const resp = await openai.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: "Devuelve SOLO el mensaje final. Sin explicaciones." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.75,
+    });
 
-                      <TableCell>{lead.profiles?.business_type ?? '-'}</TableCell>
-                      <TableCell>
-                        {[lead.profiles?.city, lead.profiles?.country].filter(Boolean).join(', ') || '-'}
-                      </TableCell>
-                      <TableCell>{lead.confidence ?? '-'}</TableCell>
+    let text = (resp.choices?.[0]?.message?.content ?? "").trim();
+    if (!text) return { copy: fallback, source: "fallback" as const, error: "empty_response" };
 
-                      <TableCell className="whitespace-nowrap">
-                        <span className="text-xs">
-                          {lead.copy_source ?? 'fallback'}
-                        </span>
-                        {lead.copy_error ? (
-                          <div className="mt-1 max-w-[180px] truncate text-[10px] text-rose-600">
-                            {lead.copy_error}
-                          </div>
-                        ) : null}
-                      </TableCell>
+    text = text.replace(/¿/g, "").replace(/\?{2,}/g, "?");
+    return { copy: text, source: "openai" as const, error: null as string | null };
+  } catch (err: any) {
+    const msg = (err?.message || err?.toString?.() || "openai_error").slice(0, 160);
+    return { copy: fallback, source: "fallback" as const, error: msg };
+  }
+}
 
-                      <TableCell className="min-w-[340px]">
-                        <textarea
-                          readOnly
-                          value={copy}
-                          className="w-full rounded border border-slate-200 p-2 text-xs leading-5"
-                          rows={5}
-                        />
-                      </TableCell>
+export async function POST(request: NextRequest) {
+  const user = await getAuthenticatedUser();
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-                      <TableCell>
-                        {handle ? (
-                          <Button onClick={() => handleSendDM(handle, copy)} className="whitespace-nowrap">
-                            Enviar DM
-                          </Button>
-                        ) : (
-                          '-'
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      ) : null}
-    </section>
-  );
+  if (!checkRateLimit(user.id)) {
+    return NextResponse.json({ error: "Too many requests. Please wait and try again." }, { status: 429 });
+  }
+
+  const payload = (await request.json()) as {
+    country?: string;
+    city?: string;
+    location?: string;
+    keywords?: string;
+    profileType?: "PT" | "Center";
+    count?: number;
+    actor?: string;
+  };
+
+  if (!payload.keywords || !payload.profileType) {
+    return NextResponse.json({ error: "keywords and profileType are required" }, { status: 400 });
+  }
+  if (payload.profileType !== "PT" && payload.profileType !== "Center") {
+    return NextResponse.json({ error: "profileType must be PT or Center" }, { status: 400 });
+  }
+
+  const profileType = payload.profileType as "PT" | "Center";
+  const count = Math.min(Math.max(Number(payload.count ?? 20), 1), 100);
+  const keywords = payload.keywords.trim();
+
+  const { country, city } = parseLocation(payload.location, payload.city, payload.country);
+
+  const locationForSearch =
+    city && country ? `${city}, ${country}` : country ? country : (payload.location ?? "").trim();
+
+  if (!locationForSearch) {
+    return NextResponse.json({ error: "location is required (or provide country)" }, { status: 400 });
+  }
+
+  const actor = (payload.actor ?? "").trim() || ((user as any).email ?? user.id);
+
+  try {
+    const searchOutput = await runInstagramDeepSearch({
+      location: locationForSearch,
+      keywords,
+      profileType,
+      count,
+    });
+
+    const admin = createAdminClient();
+    const workspaceId = await getUserWorkspaceId();
+
+    const queryLabel = `${profileType}: ${keywords} @ ${locationForSearch}`;
+
+    const { data: run, error: runError } = await admin
+      .from("search_runs")
+      .insert({
+        workspace_id: workspaceId,
+        owner_id: user.id,
+        query: queryLabel,
+        filters: {
+          actor,
+          profileType,
+          country,
+          city,
+          locationForSearch,
+          keywords,
+          queriesTried: searchOutput.queries.length,
+          failures: searchOutput.failures.length,
+        },
+        results_count: searchOutput.selected.length,
+      })
+      .select("id")
+      .single();
+
+    if (runError || !run) {
+      return NextResponse.json({ error: runError?.message ?? "Failed to create search run" }, { status: 500 });
+    }
+
+    const profileRows = searchOutput.selected.map((item) => ({
+      instagram_handle: normalizeHandle(item.handle),
+      full_name: null,
+      bio: safeText(item.snippet) || null,
+      website: null,
+      business_type: profileType === "PT" ? "Personal Trainer" : "Fitness Center",
+      city,
+      country,
+      source_payload: {
+        source: "serper",
+        actor,
+        query: item.sourceQuery,
+        title: item.title,
+        snippet: item.snippet,
+        score: item.bestScore,
+        search_run_id: run.id,
+      },
+    }));
+
+    const { data: savedProfiles, error: profilesError } = await admin
+      .from("profiles")
+      .upsert(profileRows, { onConflict: "instagram_handle" })
+      .select("id,instagram_handle,bio,website,full_name,business_type,city,country");
+
+    if (profilesError || !savedProfiles) {
+      return NextResponse.json({ error: profilesError?.message ?? "Failed to save profiles" }, { status: 500 });
+    }
+
+    const profileByHandle = new Map((savedProfiles as any[]).map((p) => [p.instagram_handle, p.id]));
+    const savedProfileByHandle = new Map((savedProfiles as any[]).map((p) => [p.instagram_handle, p]));
+
+    const copies = await mapWithConcurrency(searchOutput.selected, 4, async (item) => {
+      const handle = normalizeHandle(item.handle);
+      const prof = savedProfileByHandle.get(handle);
+      const title = safeText(item.title);
+      const snippet = safeText(item.snippet);
+
+      const out = await generateCopyOpenAIPlain({
+        actor,
+        profileType,
+        handle,
+        title,
+        snippet: prof?.bio ?? snippet,
+        country,
+        city,
+      });
+
+      return { handle, ...out };
+    });
+
+    const copyByHandle = new Map(copies.map((c) => [c.handle, c]));
+
+    const leadRows = searchOutput.selected
+      .map((item) => {
+        const handle = normalizeHandle(item.handle);
+        const profileId = profileByHandle.get(handle);
+        if (!profileId) return null;
+
+        const prof = savedProfileByHandle.get(handle);
+        const meta = copyByHandle.get(handle);
+
+        return {
+          workspace_id: workspaceId,
+          profile_id: profileId,
+          owner_id: user.id,
+          actor,
+          status: "new" as const,
+          source_query: item.sourceQuery,
+          confidence: Math.min(100, Math.max(0, Math.round(item.bestScore * 10))),
+          discovered_at: new Date().toISOString(),
+
+          display_name: prof?.full_name ?? null,
+          bio: prof?.bio ?? null,
+          website: prof?.website ?? null,
+          generated_copy: meta?.copy ?? null,
+        };
+      })
+      .filter(Boolean);
+
+    const { data: leads, error: leadsError } = await admin
+      .from("leads")
+      .upsert(leadRows as any, { onConflict: "workspace_id,profile_id" })
+      .select(
+        "id,owner_id,actor,status,source_query,confidence,discovered_at,display_name,bio,website,generated_copy,profiles(instagram_handle,full_name,bio,website,business_type,city,country)"
+      );
+
+    if (leadsError) {
+      return NextResponse.json({ error: leadsError.message }, { status: 500 });
+    }
+
+    const leadsWithCopyMeta = (leads ?? []).map((l: any) => {
+      const handle = normalizeHandle(l?.profiles?.instagram_handle ?? "");
+      const meta = copyByHandle.get(handle);
+      return {
+        ...l,
+        copy_source: meta?.source ?? "fallback",
+        copy_error: meta?.error ?? null,
+      };
+    });
+
+    return NextResponse.json({
+      runId: run.id,
+      actor,
+      locationForSearch,
+      parsed: { country, city },
+      queryCount: searchOutput.queries.length,
+      failures: searchOutput.failures,
+      leads: leadsWithCopyMeta,
+    });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Search failed unexpectedly" },
+      { status: 500 }
+    );
+  }
 }
