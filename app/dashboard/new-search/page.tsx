@@ -16,13 +16,20 @@ type SearchLead = {
   source_query: string | null;
   confidence: number | null;
   discovered_at: string;
+
+  // ⬇️ viene del backend /api/search-instagram
+  generated_copy?: string | null;
+  copy_source?: 'openai' | 'fallback';
+  copy_error?: string | null;
+
   profiles: {
     instagram_handle: string;
     full_name: string | null;
     business_type: string | null;
     city: string | null;
     country: string | null;
-    bio?: string | null; // por si lo añadimos luego desde API
+    bio?: string | null;
+    website?: string | null;
   } | null;
 };
 
@@ -34,12 +41,8 @@ type SearchResponse = {
 };
 
 export default function NewSearchPage() {
-  // Location = macro: país / ciudad, país / Online, país
   const [location, setLocation] = useState('CDMX, Mexico');
-
-  // Keywords = micro: barrio, modalidad, nicho, etc.
   const [keywords, setKeywords] = useState('personal trainer fuerza polanco');
-
   const [profileType, setProfileType] = useState<'PT' | 'Center'>('PT');
   const [count, setCount] = useState(20);
 
@@ -49,11 +52,9 @@ export default function NewSearchPage() {
   const [progress, setProgress] = useState(0);
   const [displayProcessed, setDisplayProcessed] = useState(0);
 
-  // ⚠️ TEMPORAL: en esta pantalla no tenemos el email del usuario autenticado.
-  // Más adelante lo hacemos automático desde backend.
-  const ownerEmailForCopy = 'albertorey@harbiz.io';
+  // fallback por si backend no manda generated_copy (ya no debería pasar)
+  const ownerEmailForFallback = 'albertorey@harbiz.io';
 
-  // estimación fija solo para la barrita de progreso
   const totalQueries = useMemo(() => 40, []);
 
   useEffect(() => {
@@ -130,8 +131,6 @@ export default function NewSearchPage() {
     try {
       await navigator.clipboard.writeText(message);
       window.open(`https://www.instagram.com/${username}/`, '_blank', 'noopener,noreferrer');
-      // opcional: alert corto
-      // alert("Copiado ✅ Pega el mensaje en Instagram (Cmd/Ctrl+V) y envía.");
     } catch {
       window.open(`https://www.instagram.com/${username}/`, '_blank', 'noopener,noreferrer');
       alert('No pude copiar automáticamente. Copia el mensaje manualmente:\n\n' + message);
@@ -253,6 +252,7 @@ export default function NewSearchPage() {
                   <TableHead>Business type</TableHead>
                   <TableHead>Location</TableHead>
                   <TableHead>Confidence</TableHead>
+                  <TableHead>Source</TableHead>
                   <TableHead>Copy</TableHead>
                   <TableHead>DM</TableHead>
                 </TableRow>
@@ -260,16 +260,15 @@ export default function NewSearchPage() {
               <TableBody>
                 {result.leads.map((lead) => {
                   const handle = (lead.profiles?.instagram_handle ?? '').replace(/^@/, '');
+                  const bioFallback = (lead.profiles as any)?.bio ?? lead.source_query ?? '';
 
-                  // Si en el futuro la API devuelve profiles.bio, lo usamos.
-                  // Si no, usamos source_query como fallback (no ideal, pero genera algo).
-                  const bioFallback = (lead as any)?.profiles?.bio ?? lead.source_query ?? '';
-
-                  const copy = generateHarbizCopy({
-                    ownerEmail: ownerEmailForCopy,
+                  const fallbackCopy = generateHarbizCopy({
+                    ownerEmail: ownerEmailForFallback,
                     displayName: lead.profiles?.full_name ?? '',
                     bio: bioFallback,
                   });
+
+                  const copy = lead.generated_copy || fallbackCopy;
 
                   return (
                     <TableRow key={lead.id}>
@@ -294,6 +293,17 @@ export default function NewSearchPage() {
                       </TableCell>
                       <TableCell>{lead.confidence ?? '-'}</TableCell>
 
+                      <TableCell className="whitespace-nowrap">
+                        <span className="text-xs">
+                          {lead.copy_source ?? 'fallback'}
+                        </span>
+                        {lead.copy_error ? (
+                          <div className="mt-1 max-w-[180px] truncate text-[10px] text-rose-600">
+                            {lead.copy_error}
+                          </div>
+                        ) : null}
+                      </TableCell>
+
                       <TableCell className="min-w-[340px]">
                         <textarea
                           readOnly
@@ -305,10 +315,7 @@ export default function NewSearchPage() {
 
                       <TableCell>
                         {handle ? (
-                          <Button
-                            onClick={() => handleSendDM(handle, copy)}
-                            className="whitespace-nowrap"
-                          >
+                          <Button onClick={() => handleSendDM(handle, copy)} className="whitespace-nowrap">
                             Enviar DM
                           </Button>
                         ) : (
